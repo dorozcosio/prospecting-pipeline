@@ -1,7 +1,7 @@
 institutions:
-  - name: MIT
-    domain: mit.edu
-  - name: Stanford University
-    domain: stanford.edu
-  - name: University of California, Berkeley
-    domain: berkeley.edu
+  - name: "MIT"
+    domain: "mit.edu"
+  - name: "Stanford University"
+    domain: "stanford.edu"
+  - name: "Harvard University"
+    domain: "harvard.edu"
