@@ -1,0 +1,5 @@
+scholar_cache_days: 90
+haiku_batch_size: 30
+sonnet_batch_size: 7
+scholar_delay_range: [10, 30]
+scholar_backend: serpapi
