@@ -18,6 +18,11 @@ service_account*.json
 .cache/
 cache/
 scholar_cache/
+cache.db
+
+# Logs
+logs/*.log
+logs/*.jsonl
 
 # IDE
 .vscode/settings.json
