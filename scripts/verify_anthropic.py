@@ -17,7 +17,7 @@ if not API_KEY:
 
 import anthropic
 
-MODEL = "claude-haiku-4-5-20250929"
+MODEL = "claude-haiku-4-5-20251001"
 
 def main():
     client = anthropic.Anthropic(api_key=API_KEY)
