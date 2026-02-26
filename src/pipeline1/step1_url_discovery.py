@@ -90,7 +90,7 @@ def _llm_filter(institution_name: str, candidates: list[dict]) -> list[dict]:
         f"Institution: {institution_name}\n"
         f"Candidate URLs:\n{numbered}\n"
         "Which of these URLs are most likely to be faculty/PI listing pages for "
-        "departments related to AI, computational biology, or healthcare technology? "
+        "departments related to medical AI, clinical machine learning, or health informatics? "
         "Return ONLY a JSON array of the URL numbers, e.g. [1, 3, 5]. Pick up to 5."
     )
     system = "You select URLs most likely to be faculty listing pages for research departments."
@@ -139,9 +139,9 @@ def discover_urls(config: Config) -> dict[str, list[dict]]:
         logger.info("Discovering URLs for %s", name)
 
         queries = [
-            f'"{name}" AI biological research faculty',
-            f'"{name}" computational biology faculty',
-            f'"{name}" healthcare AI initiative members',
+            f'"{name}" medical AI research faculty',
+            f'"{name}" artificial intelligence medicine faculty department',
+            f'"{name}" clinical machine learning health informatics faculty',
         ]
 
         # Collect all hits across queries, deduplicating by URL
