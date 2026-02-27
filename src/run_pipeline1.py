@@ -19,6 +19,16 @@ Flags:
                         Saves would-be rows to logs/p1_dry_run_{ts}.json.
     --group-size N      Number of PIs to process per incremental write batch
                         (default: 15).
+syncs it to the Master List Google Sheet.
+
+Usage:
+    python -m src.run_pipeline1 [--dry-run] [--institution NAME]
+
+Flags:
+    --dry-run           Run all steps but do not write to the sheet.
+                        Saves the would-be rows to logs/p1_dry_run_{ts}.json.
+    --institution NAME  Run for a single institution only (must match a name
+                        in config/institutions.yaml). Defaults to all.
 """
 import argparse
 import json
@@ -42,6 +52,10 @@ from src.pipeline1.step6_sheet_writer import init_run_cache, write_pipeline1_res
 logger = logging.getLogger(__name__)
 
 _DEFAULT_GROUP_SIZE = 15
+
+from src.pipeline1.step6_sheet_writer import write_pipeline1_results
+
+logger = logging.getLogger(__name__)
 
 
 def run_pipeline1(
@@ -70,6 +84,18 @@ def run_pipeline1(
         resume:     Start from an existing checkpoint.
         group_size: Number of PIs processed per incremental write.
         tab_name:   Target sheet tab (default "Master List").
+    urls_override: dict | None = None,
+    tab_name: str = "Master List",
+) -> dict:
+    """
+    Execute all Pipeline 1 steps.
+
+    Args:
+        dry_run:        If True, skip the sheet write and save rows to a JSON file.
+        institution:    Limit run to this institution name (as in institutions.yaml).
+        urls_override:  Optional {institution_name: [url_dicts]} to skip step 1.
+                        Useful for testing and re-runs without fresh URL discovery.
+        tab_name:       Sheet tab to write results to (default "Master List").
 
     Returns:
         {institutions_processed, pis_found, members_found, members, sheet_summary}
@@ -97,10 +123,22 @@ def run_pipeline1(
     all_urls = discover_urls(config)
     if institution:
         all_urls = {k: v for k, v in all_urls.items() if k == institution}
+    # Step 1: URL discovery (or use override)
+    # ------------------------------------------------------------------
+    if urls_override is not None:
+        all_urls = urls_override
+        logger.info("Step 1: using %d URL dict(s) from override", len(all_urls))
+    else:
+        all_urls = discover_urls(config)
+        if institution:
+            all_urls = {k: v for k, v in all_urls.items() if k == institution}
 
     for inst_name, urls in all_urls.items():
         logger.info("Step 1: %s — %d URL(s) discovered", inst_name, len(urls))
 
+    # ------------------------------------------------------------------
+    # Step 2: Extract PIs
+    # ------------------------------------------------------------------
     all_pis: list[dict] = []
     for inst_name, urls in all_urls.items():
         pis = extract_pis(inst_name, urls, config)
@@ -204,6 +242,46 @@ def run_pipeline1(
     # Dry-run save
     # ------------------------------------------------------------------
     sheet_summary: dict = {}
+    logger.info("Step 2 total: %d PI(s) across %d institution(s)", len(all_pis), len(all_urls))
+
+    # ------------------------------------------------------------------
+    # Step 3: Find lab homepages
+    # ------------------------------------------------------------------
+    all_pis = find_lab_homepages(all_pis, config)
+    found_homepages = sum(1 for p in all_pis if p.get("lab_homepage_url"))
+    missing_homepages = len(all_pis) - found_homepages
+    logger.info(
+        "Step 3: %d/%d PIs have a homepage (%d missing)",
+        found_homepages, len(all_pis), missing_homepages,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 4: Find member pages
+    # ------------------------------------------------------------------
+    all_pis = find_member_pages(all_pis, config)
+    found_member_pages = sum(1 for p in all_pis if p.get("lab_members_url"))
+    missing_member_pages = len(all_pis) - found_member_pages
+    logger.info(
+        "Step 4: %d/%d PIs have a members page (%d missing)",
+        found_member_pages, len(all_pis), missing_member_pages,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 5: Extract members
+    # ------------------------------------------------------------------
+    members = extract_members(all_pis, config)
+    pi_rows = sum(1 for m in members if m.get("member_role") == "PI")
+    member_rows = sum(1 for m in members if m.get("member_role") != "PI")
+    logger.info(
+        "Step 5: %d PI rows + %d member rows = %d total",
+        pi_rows, member_rows, len(members),
+    )
+
+    # ------------------------------------------------------------------
+    # Step 6: Write to sheet (or dry run)
+    # ------------------------------------------------------------------
+    sheet_summary: dict = {}
+
     if dry_run:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         dry_run_path = Path("logs") / f"p1_dry_run_{ts}.json"
@@ -213,10 +291,15 @@ def run_pipeline1(
         logger.info(
             "[DRY RUN] Would write %d rows — saved to %s",
             len(dry_run_rows), dry_run_path,
+            json.dump(members, f, indent=2, default=str)
+        logger.info(
+            "[DRY RUN] Would write %d rows — saved to %s", len(members), dry_run_path
         )
         sheet_summary = {
             "added": 0, "updated": 0, "deactivated": 0, "unchanged": 0, "dry_run": True
         }
+    else:
+        sheet_summary = write_pipeline1_results(members, config, tab_name=tab_name)
 
     # ------------------------------------------------------------------
     # Final console summary
@@ -233,6 +316,8 @@ def run_pipeline1(
     print(f"  Total elapsed          : {elapsed_total / 60:.1f} min")
     if dry_run:
         print(f"  [DRY RUN] {len(all_members)} rows saved (not written to sheet)")
+    if dry_run:
+        print(f"  [DRY RUN] {len(members)} rows saved (not written to sheet)")
     else:
         print(f"  Rows added             : {sheet_summary.get('added', 0)}")
         print(f"  Rows updated           : {sheet_summary.get('updated', 0)}")
@@ -244,6 +329,7 @@ def run_pipeline1(
         "pis_found": len(all_pis),
         "members_found": member_rows,
         "members": all_members,
+        "members": members,
         "sheet_summary": sheet_summary,
     }
 
@@ -310,6 +396,16 @@ def main() -> None:
             resume=args.resume or (n_done == 0),
             group_size=args.group_size,
         )
+        "--institution",
+        metavar="NAME",
+        help="Run for a single institution only (e.g. 'MIT').",
+    )
+    args = parser.parse_args()
+
+    setup_logging()
+
+    try:
+        run_pipeline1(dry_run=args.dry_run, institution=args.institution)
     except Exception:
         logger.error("Pipeline 1 failed:\n%s", traceback.format_exc())
         sys.exit(1)
