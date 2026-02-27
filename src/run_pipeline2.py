@@ -144,6 +144,40 @@ def run_pipeline2(
     if dry_run:
         print(f"  [DRY RUN] Output saved — not written to sheet")
 
+    # Per-institution breakdown — read updated sheet state (or use dry-run scores)
+    if not dry_run:
+        from src.sheets import SheetsClient
+        _client = SheetsClient(config)
+        _all_rows = _client.read_all_rows(tab_name)
+    else:
+        # In dry-run mode, approximate from in-memory relevance scores only
+        _all_rows = relevance_scores
+
+    unique_institutions = sorted({
+        r.get("institution", "") for r in _all_rows if r.get("institution")
+    })
+    if unique_institutions:
+        print("\n=== Results by Institution ===")
+        for inst in unique_institutions:
+            inst_rows = [r for r in _all_rows if r.get("institution") == inst]
+            active = [
+                r for r in inst_rows
+                if r.get("status", "active") not in ("inactive",)
+            ]
+            relevant = [
+                r for r in active
+                if str(r.get("relevance_flag", "")).upper() in ("TRUE", "1") or
+                r.get("relevance_flag") is True
+            ]
+            last_scraped = max(
+                (r.get("institution_last_scraped", "") for r in inst_rows if r.get("institution_last_scraped")),
+                default="unknown",
+            )
+            print(
+                f"  {inst}: {len(relevant)} relevant / {len(active)} active "
+                f"(last scraped: {last_scraped})"
+            )
+
     return {
         "passing_pis": passing_pis,
         "members_scored": len(relevance_scores),

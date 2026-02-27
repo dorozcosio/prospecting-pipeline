@@ -31,10 +31,11 @@ MASTER_LIST_SCHEMA: list[str] = [
     "last_enriched",
     "situation_of_interest",
     "status",
+    "institution_last_scraped",  # ISO timestamp of when Pipeline 1 last scraped this institution
 ]
 
-# Last column letter for batchUpdate ranges (A=1 … P=16)
-_LAST_COL = chr(64 + len(MASTER_LIST_SCHEMA))  # 'P'
+# Last column letter for batchUpdate ranges (A=1 … Q=17)
+_LAST_COL = chr(64 + len(MASTER_LIST_SCHEMA))  # 'Q'
 
 
 class SheetsClient:
