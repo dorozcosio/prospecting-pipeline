@@ -99,6 +99,11 @@ def write_pipeline2_results(
         if not member_name or not pi_name:
             continue
 
+        # Only score active rows — inactive rows were removed from source pages
+        # and should not receive a fresh relevance assessment.
+        if row.get("status", "").strip().lower() == "inactive":
+            continue
+
         key = (pi_name, member_name)
         update: dict = {
             "institution": institution,
@@ -118,9 +123,10 @@ def write_pipeline2_results(
             if score["relevance_flag"]:
                 flagged_relevant += 1
         else:
-            # Not scored (PI didn't pass coarse filter) — still write defaults
+            # PI didn't pass coarse filter — still write a clear not-relevant
+            # assessment so every active row has a current relevance reading.
             update["relevance_flag"] = False
-            update["relevance_reasoning"] = ""
+            update["relevance_reasoning"] = "PI lab not relevant to current situation"
 
         update["situation_of_interest"] = situation
 

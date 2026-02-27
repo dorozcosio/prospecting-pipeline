@@ -101,11 +101,19 @@ def coarse_filter_pis(
     client = SheetsClient(config)
     all_rows = client.read_all_rows(tab_name)
 
-    # Deduplicate active PIs by (institution, pi_name)
+    # Intentionally reads ALL institutions — Pipeline 2 scores the full active
+    # roster regardless of which institutions Pipeline 1 ran most recently.
+    # Cached lab summaries and paper titles from previous scraping runs remain
+    # valuable whenever the situation of interest changes.
+
+    # Deduplicate active PIs by (institution, pi_name).
+    # Blank/missing status is treated as "active" for backward compatibility
+    # with rows written before the status column was introduced.
     seen: set[tuple[str, str]] = set()
     pi_list: list[dict] = []
     for row in all_rows:
-        if row.get("status", "").strip().lower() != "active":
+        status = row.get("status", "").strip().lower()
+        if status not in ("active", ""):
             continue
         key = (row.get("institution", "").strip(), row.get("pi_name", "").strip())
         if key in seen or not key[1]:
