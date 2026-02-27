@@ -3,7 +3,8 @@ Pipeline 1, Step 5: Extract lab member names/roles and build flat row dicts.
 
 For each PI with a lab_members_url:
   - Fetch the members page (cache-first), clean HTML
-  - Batch up to 5 pages per Sonnet call
+  - Route to Haiku (default) or Sonnet (long + unstructured pages)
+  - Batch pages per model using token-aware batching from config
   - Parse {pi_name: [{name, role}]} JSON response
   - Emit one row per member + one "PI" row for the PI themselves
   - Each row carries all known PI-level fields so it is ready to write to Sheets
@@ -30,7 +31,28 @@ _HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
-_BATCH_SIZE = 5
+
+# Role keywords that indicate a structured member list (used for model routing)
+_ROLE_KEYWORDS = [
+    "postdoc", "phd student", "graduate student", "research scientist",
+    "research assistant", "undergraduate", "professor", "fellow",
+    "ph.d.", "research associate", "lab manager",
+]
+
+
+# ---------------------------------------------------------------------------
+# Model routing
+# ---------------------------------------------------------------------------
+
+def _choose_model_for_member_extraction(cleaned_text: str) -> str:
+    """
+    Use Haiku for most pages.
+    Only escalate to Sonnet for long, unstructured pages (>8000 chars AND <2 role keywords).
+    """
+    role_count = sum(1 for kw in _ROLE_KEYWORDS if kw.lower() in cleaned_text.lower())
+    if len(cleaned_text) > 8000 and role_count < 2:
+        return "sonnet"
+    return "haiku"
 
 
 # ---------------------------------------------------------------------------
@@ -55,9 +77,9 @@ def _fetch(url: str) -> str | None:
 # LLM extraction
 # ---------------------------------------------------------------------------
 
-def _extract_batch(batch: list[dict]) -> dict[str, list[dict]]:
+def _extract_batch(batch: list[dict], model: str = "haiku") -> dict[str, list[dict]]:
     """
-    Send up to BATCH_SIZE member pages to Sonnet.
+    Send a batch of member pages to the specified model.
     Returns {pi_name: [{name, role}, …]}.
     """
     parts = [
@@ -82,7 +104,12 @@ def _extract_batch(batch: list[dict]) -> dict[str, list[dict]]:
         "Return structured JSON only."
     )
 
-    response = llm.call_sonnet(prompt=user_prompt, system=system)
+    logger.debug("Extracting members from %d pages with %s", len(batch), model)
+    if model == "sonnet":
+        response = llm.call_sonnet(prompt=user_prompt, system=system)
+    else:
+        response = llm.call_haiku(prompt=user_prompt, system=system)
+
     json_str = extract_json_str(response)
 
     try:
@@ -141,8 +168,9 @@ def extract_members(pis: list[dict], config: Config) -> list[dict]:
     Each row has: institution, department_program, pi_name, lab_research_summary,
     lab_homepage_url, lab_members_url, member_name, member_role.
     """
-    # Phase 1 — fetch member pages
-    page_items: list[dict] = []
+    # Phase 1 — fetch member pages and route to model
+    haiku_items: list[dict] = []
+    sonnet_items: list[dict] = []
     pi_no_page: list[dict] = []
 
     for pi in pis:
@@ -156,38 +184,61 @@ def extract_members(pis: list[dict], config: Config) -> list[dict]:
             pi_no_page.append(pi)
             continue
 
-        page_items.append({
+        text = clean_html(html)
+        model = _choose_model_for_member_extraction(text)
+        item = {
             "pi": pi,
             "pi_name": pi["name"],
             "url": members_url,
-            "text": clean_html(html),
-        })
+            "text": text,
+        }
+        logger.debug("Routing %s member page to %s", pi["name"], model)
+        if model == "sonnet":
+            sonnet_items.append(item)
+        else:
+            haiku_items.append(item)
 
-    # Phase 2 — batch Sonnet calls
+    if sonnet_items:
+        logger.info(
+            "extract_members: %d pages → Haiku, %d pages → Sonnet",
+            len(haiku_items), len(sonnet_items),
+        )
+
+    # Phase 2 — batch LLM calls per model
     all_rows: list[dict] = []
+    processed_pis: set[str] = set()
 
-    for batch in chunks(page_items, _BATCH_SIZE):
-        extracted = _extract_batch(batch)
+    for model, items, batch_size in (
+        ("haiku", haiku_items, config.settings.haiku_batch_size),
+        ("sonnet", sonnet_items, config.settings.sonnet_batch_size),
+    ):
+        if not items:
+            continue
+        texts = [item["text"] for item in items]
+        for index_batch in llm.build_batches(texts, max_items=batch_size):
+            batch = [items[i] for i in index_batch]
+            extracted = _extract_batch(batch, model=model)
 
-        for item in batch:
-            pi = item["pi"]
-            pi_name = item["pi_name"]
+            for item in batch:
+                pi = item["pi"]
+                pi_name = item["pi_name"]
+                processed_pis.add(pi_name)
 
-            # Always add a PI row
-            all_rows.append(_pi_row(pi))
+                all_rows.append(_pi_row(pi))
 
-            members = extracted.get(pi_name, [])
-            if not isinstance(members, list):
-                logger.warning("Unexpected member list type for %s: %s", pi_name, type(members))
-                continue
-
-            for member in members:
-                if not isinstance(member, dict) or not member.get("name"):
+                members = extracted.get(pi_name, [])
+                if not isinstance(members, list):
+                    logger.warning(
+                        "Unexpected member list type for %s: %s", pi_name, type(members)
+                    )
                     continue
-                # Skip if member is the PI themselves (common on some pages)
-                if member["name"].strip().lower() == pi_name.lower():
-                    continue
-                all_rows.append(_member_row(pi, member))
+
+                for member in members:
+                    if not isinstance(member, dict) or not member.get("name"):
+                        continue
+                    if member["name"].strip().lower() == pi_name.lower():
+                        continue
+                    all_rows.append(_member_row(pi, member))
 
     # PIs with no member page still get a PI row
     for pi in pi_no_page:

@@ -15,8 +15,10 @@ ROOT = Path(__file__).parent.parent
 @dataclass
 class Settings:
     scholar_cache_days: int = 90
-    haiku_batch_size: int = 30
-    sonnet_batch_size: int = 7
+    haiku_batch_size: int = 40
+    sonnet_batch_size: int = 15
+    sonnet_call_delay: float = 13.0
+    haiku_call_delay: float = 13.0
     scholar_delay_range: list = field(default_factory=lambda: [10, 30])
     scholar_backend: str = "serpapi"
 
@@ -62,7 +64,8 @@ def load_config() -> Config:
         with open(settings_path) as f:
             raw = yaml.safe_load(f) or {}
         for field_name in ("scholar_cache_days", "haiku_batch_size",
-                           "sonnet_batch_size", "scholar_delay_range", "scholar_backend"):
+                           "sonnet_batch_size", "sonnet_call_delay", "haiku_call_delay",
+                           "scholar_delay_range", "scholar_backend"):
             if field_name in raw:
                 setattr(settings, field_name, raw[field_name])
 

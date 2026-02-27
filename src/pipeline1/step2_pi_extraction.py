@@ -4,7 +4,7 @@ Pipeline 1, Step 2: Extract PI/faculty names from listing pages.
 For each URL from Step 1:
   - Fetch HTML (cache-first)
   - Strip noise tags, truncate to ~8 000 tokens
-  - Batch up to 5 pages into a single Sonnet call
+  - Batch pages into a single Sonnet call (batch size from config)
   - Parse the JSON response, deduplicate names
 """
 import json
@@ -28,7 +28,6 @@ _HEADERS = {
     )
 }
 _MAX_PAGE_CHARS = 32_000  # ≈ 8 000 tokens
-_BATCH_SIZE = 5
 
 # URL path/host fragments → human-readable department labels
 _DEPT_HINTS: dict[str, str] = {
@@ -209,9 +208,12 @@ def extract_pis(institution: str, urls: list[dict], config: Config) -> list[dict
 
     dept_map = {p["url"]: p["dept"] for p in pages}
 
-    # Phase 2 – batch Sonnet calls
+    # Phase 2 – batch Sonnet calls (token-aware batching)
     all_pis: list[dict] = []
-    for batch in chunks(pages, _BATCH_SIZE):
+    batch_size = config.settings.sonnet_batch_size
+    page_texts = [p["text"] for p in pages]
+    for index_batch in llm.build_batches(page_texts, max_items=batch_size):
+        batch = [pages[i] for i in index_batch]
         extracted = _extract_batch(batch)
 
         for page in batch:
