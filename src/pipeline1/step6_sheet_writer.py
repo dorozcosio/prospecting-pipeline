@@ -3,12 +3,17 @@ Pipeline 1, Step 6: Sync member rows to the Master List Google Sheet tab.
 
 Strategy:
   - Read all existing rows from the tab (keyed by composite key).
+    The read result is cached in memory; subsequent calls within the same
+    process reuse the cache so the sheet is only read once per run.
   - For each incoming row:
       * NEW  → append with status="active"
       * CHANGED (P1 fields only) → update changed fields
       * UNCHANGED → skip
-  - Rows previously in the sheet but NOT in this run → mark status="inactive"
-    (only if they were status="active"; P2 fields are never cleared)
+  - Deactivation (only when deactivate_missing=True):
+      Rows that were previously "active" but are absent from the incoming
+      batch are marked status="inactive" — scoped to the institutions
+      present in the incoming batch so cross-institution rows are never
+      touched.
 
 Composite key: (institution, pi_name, member_name)  — all lowercased/stripped.
 
@@ -21,6 +26,7 @@ P2-owned columns (never touched by this step):
     relevance_reasoning, email, last_enriched, situation_of_interest
 """
 import logging
+from typing import Any
 
 from src.config import Config
 from src.sheets import SheetsClient
@@ -42,6 +48,17 @@ _P1_FIELDS: set[str] = {
 
 _KEY_COLS = ("institution", "pi_name", "member_name")
 
+# Module-level sheet-read cache.  Populated on the first call to
+# write_pipeline1_results() within a process; cleared by init_run_cache().
+_cache: dict[tuple, dict] | None = None
+
+
+def init_run_cache() -> None:
+    """Reset the in-memory sheet cache.  Call this at the start of each run."""
+    global _cache
+    _cache = None
+    logger.debug("step6 sheet cache cleared")
+
 
 def _composite_key(row: dict) -> tuple[str, str, str]:
     return (
@@ -55,18 +72,25 @@ def write_pipeline1_results(
     members: list[dict],
     config: Config,
     tab_name: str = "Master List",
+    deactivate_missing: bool = True,
 ) -> dict:
     """
     Sync a flat list of member dicts (from Step 5) to a Google Sheet tab.
 
     Args:
-        members:  Output of extract_members() — one dict per person.
-        config:   Loaded Config.
-        tab_name: Target tab name (default "Master List").
+        members:           Output of extract_members() — one dict per person.
+        config:            Loaded Config.
+        tab_name:          Target tab name (default "Master List").
+        deactivate_missing: When True (default), rows previously in the sheet
+                           for the same institutions that are absent from this
+                           batch are marked status="inactive".
+                           Pass False for incremental group writes mid-run.
 
     Returns:
         {"added": int, "updated": int, "deactivated": int, "unchanged": int}
     """
+    global _cache
+
     client = SheetsClient(config)
 
     # ------------------------------------------------------------------
@@ -77,15 +101,17 @@ def write_pipeline1_results(
         logger.info("Created tab '%s'", tab_name)
 
     # ------------------------------------------------------------------
-    # 2. Read existing rows
+    # 2. Read existing rows (use cache if available)
     # ------------------------------------------------------------------
-    existing_rows = client.read_all_rows(tab_name)
-    existing_index: dict[tuple, dict] = {}   # key → row dict
-    existing_sheet_rows: dict[tuple, int] = {}  # key → 1-based sheet row
-    for i, row in enumerate(existing_rows):
-        k = _composite_key(row)
-        existing_index[k] = row
-        existing_sheet_rows[k] = i + 2  # +1 for 1-index, +1 for header
+    if _cache is None:
+        existing_rows = client.read_all_rows(tab_name)
+        _cache = {}
+        for row in existing_rows:
+            k = _composite_key(row)
+            _cache[k] = row
+        logger.debug("Sheet cache populated: %d existing rows", len(_cache))
+
+    existing_index = _cache  # alias for clarity
 
     # ------------------------------------------------------------------
     # 3. Classify incoming rows
@@ -105,7 +131,6 @@ def write_pipeline1_results(
             to_append.append(row)
         else:
             existing = existing_index[key]
-            # Compare only P1-owned fields (excluding status, which we manage)
             changed = any(
                 row.get(f, "") != existing.get(f, "")
                 for f in _P1_FIELDS - {"status"}
@@ -120,14 +145,24 @@ def write_pipeline1_results(
                 unchanged_count += 1
 
     # ------------------------------------------------------------------
-    # 4. Deactivate rows no longer in this run
+    # 4. Deactivate rows no longer in this run (scoped to institutions
+    #    present in the incoming batch to avoid touching other institutions)
     # ------------------------------------------------------------------
     to_deactivate: list[dict] = []
-    for key, existing in existing_index.items():
-        if key not in incoming_keys and existing.get("status", "") == "active":
-            deactivated = {col: existing.get(col, "") for col in existing}
-            deactivated["status"] = "inactive"
-            to_deactivate.append(deactivated)
+    if deactivate_missing:
+        scope_institutions = {
+            m.get("institution", "").strip().lower() for m in members
+        }
+        for key, existing in existing_index.items():
+            inst = existing.get("institution", "").strip().lower()
+            if (
+                inst in scope_institutions
+                and key not in incoming_keys
+                and existing.get("status", "") == "active"
+            ):
+                deactivated = {col: existing.get(col, "") for col in existing}
+                deactivated["status"] = "inactive"
+                to_deactivate.append(deactivated)
 
     # ------------------------------------------------------------------
     # 5. Write to Sheets
@@ -135,14 +170,21 @@ def write_pipeline1_results(
     if to_append:
         client.append_rows(tab_name, to_append)
         logger.info("Appended %d new row(s) to '%s'", len(to_append), tab_name)
+        # Update cache with newly appended rows
+        for row in to_append:
+            _cache[_composite_key(row)] = row
 
     if to_update:
         client.update_rows(tab_name, to_update, list(_KEY_COLS))
         logger.info("Updated %d row(s) in '%s'", len(to_update), tab_name)
+        for row in to_update:
+            _cache[_composite_key(row)] = row
 
     if to_deactivate:
         client.update_rows(tab_name, to_deactivate, list(_KEY_COLS))
         logger.info("Deactivated %d row(s) in '%s'", len(to_deactivate), tab_name)
+        for row in to_deactivate:
+            _cache[_composite_key(row)] = row
 
     summary = {
         "added": len(to_append),

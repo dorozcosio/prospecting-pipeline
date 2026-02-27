@@ -5,7 +5,10 @@ For each PI:
   - Run 2 targeted web searches
   - Check 2 common URL patterns (HEAD request)
   - Fetch the best candidate (cache-first)
-  - Batch up to 5 homepage texts into a single Sonnet call for summarization
+  - Batch homepage texts for summarization:
+      * Haiku for pages ≤ 10 000 chars (fast, cheap)
+      * Sonnet for longer / complex pages
+    Batch size comes from config (haiku_batch_size / sonnet_batch_size).
 """
 import json
 import logging
@@ -26,7 +29,9 @@ _HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
-_BATCH_SIZE = 5
+
+# Pages longer than this are routed to Sonnet instead of Haiku
+_SONNET_THRESHOLD = 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +87,18 @@ def _best_candidate(results: list[dict], domain: str) -> str | None:
     return None
 
 
+def _choose_model_for_summary(text: str) -> str:
+    """Use Haiku for short pages, Sonnet for long ones (> _SONNET_THRESHOLD chars)."""
+    return "sonnet" if len(text) > _SONNET_THRESHOLD else "haiku"
+
+
 # ---------------------------------------------------------------------------
 # LLM summarisation
 # ---------------------------------------------------------------------------
 
-def _summarize_batch(batch: list[dict]) -> dict[str, str]:
+def _summarize_batch(batch: list[dict], model: str = "haiku") -> dict[str, str]:
     """
-    Summarize a batch of lab homepages with Sonnet.
+    Summarize a batch of lab homepages with the specified model.
     Returns {pi_name: one_or_two_sentence_summary}.
     """
     parts = [
@@ -110,7 +120,12 @@ def _summarize_batch(batch: list[dict]) -> dict[str, str]:
         "Be specific about methods, model systems, and application areas."
     )
 
-    response = llm.call_sonnet(prompt=user_prompt, system=system)
+    logger.debug("Summarizing %d labs with %s", len(batch), model)
+    if model == "sonnet":
+        response = llm.call_sonnet(prompt=user_prompt, system=system)
+    else:
+        response = llm.call_haiku(prompt=user_prompt, system=system)
+
     json_str = extract_json_str(response)
 
     try:
@@ -197,14 +212,32 @@ def find_lab_homepages(pis: list[dict], config: Config) -> list[dict]:
         pi.setdefault("lab_homepage_url", "")
         pi.setdefault("lab_research_summary", "")
 
-    # 5. Batch Sonnet summarisation
+    # 5. Batch summarisation — split by model based on page length
     name_to_pi = {pi["name"]: pi for pi in enriched}
-    for batch in chunks(pages_to_summarize, _BATCH_SIZE):
-        summaries = _summarize_batch(batch)
-        for item in batch:
-            pi_ref = name_to_pi.get(item["name"])
-            if pi_ref is not None:
-                pi_ref["lab_research_summary"] = summaries.get(item["name"], "")
+
+    haiku_pages = [p for p in pages_to_summarize if _choose_model_for_summary(p["text"]) == "haiku"]
+    sonnet_pages = [p for p in pages_to_summarize if _choose_model_for_summary(p["text"]) == "sonnet"]
+
+    if sonnet_pages:
+        logger.info(
+            "find_lab_homepages: %d pages → Haiku, %d pages → Sonnet",
+            len(haiku_pages), len(sonnet_pages),
+        )
+
+    for model, pages, batch_size in (
+        ("haiku", haiku_pages, config.settings.haiku_batch_size),
+        ("sonnet", sonnet_pages, config.settings.sonnet_batch_size),
+    ):
+        if not pages:
+            continue
+        texts = [p["text"] for p in pages]
+        for index_batch in llm.build_batches(texts, max_items=batch_size):
+            batch = [pages[i] for i in index_batch]
+            summaries = _summarize_batch(batch, model=model)
+            for item in batch:
+                pi_ref = name_to_pi.get(item["name"])
+                if pi_ref is not None:
+                    pi_ref["lab_research_summary"] = summaries.get(item["name"], "")
 
     found = sum(1 for pi in enriched if pi.get("lab_homepage_url"))
     logger.info("find_lab_homepages: %d/%d PIs got a homepage", found, len(enriched))
