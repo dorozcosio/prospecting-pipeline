@@ -30,10 +30,11 @@ MASTER_LIST_SCHEMA: list[str] = [
     "email",
     "last_enriched",
     "situation_of_interest",
+    "status",
 ]
 
-# Last column letter for batchUpdate ranges (A=1 … O=15)
-_LAST_COL = chr(64 + len(MASTER_LIST_SCHEMA))  # 'O'
+# Last column letter for batchUpdate ranges (A=1 … P=16)
+_LAST_COL = chr(64 + len(MASTER_LIST_SCHEMA))  # 'P'
 
 
 class SheetsClient:
