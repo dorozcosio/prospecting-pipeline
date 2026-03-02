@@ -182,6 +182,17 @@ def write_pipeline1_results(
     # ------------------------------------------------------------------
     to_deactivate: list[dict] = []
     if deactivate_missing:
+        out_of_scope_count = sum(
+            1 for row in existing_index.values()
+            if row.get("institution", "").strip().lower() not in run_institutions
+        )
+        logger.info(
+            "Deactivation scoped to %d institution(s): %s. "
+            "%d row(s) from other institutions left unchanged.",
+            len(run_institutions),
+            sorted(run_institutions),
+            out_of_scope_count,
+        )
         for key, existing in existing_index.items():
             inst = existing.get("institution", "").strip().lower()
             if (
