@@ -21,6 +21,8 @@ class Settings:
     haiku_call_delay: float = 13.0
     scholar_delay_range: list = field(default_factory=lambda: [10, 30])
     scholar_backend: str = "serpapi"
+    scholar_flush_interval: int = 25
+    client_timeout_seconds: int = 120
 
 
 @dataclass
@@ -65,7 +67,8 @@ def load_config() -> Config:
             raw = yaml.safe_load(f) or {}
         for field_name in ("scholar_cache_days", "haiku_batch_size",
                            "sonnet_batch_size", "sonnet_call_delay", "haiku_call_delay",
-                           "scholar_delay_range", "scholar_backend"):
+                           "scholar_delay_range", "scholar_backend",
+                           "scholar_flush_interval", "client_timeout_seconds"):
             if field_name in raw:
                 setattr(settings, field_name, raw[field_name])
 
