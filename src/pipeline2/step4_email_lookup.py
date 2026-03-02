@@ -34,6 +34,18 @@ from src.pipeline1.step2_pi_extraction import clean_html
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Name normalisation for identity dedup (mirrors step2_scholar_lookup)
+# ---------------------------------------------------------------------------
+
+_MIDDLE_INITIAL_RE = re.compile(r"(?<=\s)[a-z]\.\s*")
+
+
+def _normalize_member_name(name: str) -> str:
+    n = name.strip().lower()
+    n = _MIDDLE_INITIAL_RE.sub("", n)
+    return " ".join(n.split())
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -328,61 +340,91 @@ def lookup_emails(
         inst.name: inst.domain for inst in config.institutions
     }
 
+    # ------------------------------------------------------------------
+    # Group flagged members by normalised identity for dedup.
+    # A person listed under N PIs needs only ONE lookup; the result fans
+    # to all (pi_name, member_name) keys.  If ANY row already has an
+    # email, propagate it to the others without performing any lookup.
+    # ------------------------------------------------------------------
+    identity_to_members: dict[tuple[str, str], list[dict]] = {}
     for member in flagged_members:
-        # Only process relevance-flagged members with no existing email
         if not member.get("relevance_flag"):
             continue
-        existing_email = member.get("email", "").strip()
-        if existing_email:
-            results[(member["pi_name"], member["member_name"])] = existing_email
-            continue
-
         name = member.get("member_name", "").strip()
-        pi_name = member.get("pi_name", "").strip()
         institution = member.get("institution", "").strip()
-        members_url = member.get("lab_members_url", "").strip()
-
         if not name:
             continue
+        identity = (_normalize_member_name(name), institution.lower())
+        identity_to_members.setdefault(identity, []).append(member)
 
-        key = (pi_name, name)
-        email: str | None = None
+    total_flagged = sum(len(grp) for grp in identity_to_members.values())
+    unique_people = len(identity_to_members)
+    propagated = 0
+
+    for identity, group in identity_to_members.items():
+        # Check whether any row already carries an email
+        existing_email = next(
+            (m.get("email", "").strip() for m in group if m.get("email", "").strip()),
+            "",
+        )
+        if existing_email:
+            for m in group:
+                key = (m.get("pi_name", "").strip(), m.get("member_name", "").strip())
+                results[key] = existing_email
+                if not m.get("email", "").strip():
+                    propagated += 1
+            continue
+
+        # No existing email — perform ONE lookup using the first occurrence
+        rep = group[0]
+        name = rep.get("member_name", "").strip()
+        institution = rep.get("institution", "").strip()
+        members_url = rep.get("lab_members_url", "").strip()
+
+        email: str = ""
 
         # --- Method 1: lab members page ---
-        email = _from_members_page(name, members_url)
-        if email:
-            logger.info("Email for %s found via members page: %s", name, email)
-            results[key] = email
-            continue
+        found = _from_members_page(name, members_url)
+        if found:
+            logger.info("Email for %s found via members page: %s", name, found)
+            email = found
 
         # --- Method 2: web search ---
-        email = _from_web_search(name, institution)
-        if email:
-            logger.info("Email for %s found via web search: %s", name, email)
-            results[key] = email
-            continue
+        if not email:
+            found = _from_web_search(name, institution)
+            if found:
+                logger.info("Email for %s found via web search: %s", name, found)
+                email = found
 
         # --- Method 3: institutional pattern guess ---
-        domain = domain_map.get(institution, "")
-        email = _institutional_guess(name, domain)
-        if email:
+        if not email:
+            domain = domain_map.get(institution, "")
+            found = _institutional_guess(name, domain)
+            if found:
+                logger.info(
+                    "Email for %s guessed via institutional pattern "
+                    "(MX-validated domain only): %s",
+                    name, found,
+                )
+                email = found
+
+        if not email:
             logger.info(
-                "Email for %s guessed via institutional pattern (MX-validated domain only): %s",
-                name, email,
+                "No email found for %s at %s — flagged for manual follow-up.",
+                name, institution,
             )
-            results[key] = email
-            continue
 
-        # --- Not found ---
-        logger.info(
-            "No email found for %s at %s — flagged for manual follow-up.",
-            name, institution,
-        )
-        results[key] = ""
+        # Fan result to all rows in the group
+        for m in group:
+            results[(m.get("pi_name", "").strip(), m.get("member_name", "").strip())] = email
 
-    found = sum(1 for v in results.values() if v)
+    emails_found = sum(1 for v in results.values() if v)
     logger.info(
-        "lookup_emails: %d members processed — %d emails found, %d not found",
-        len(results), found, len(results) - found,
+        "Email lookups: %d flagged row(s) → %d unique member(s) "
+        "(%d duplicate lookup(s) avoided). "
+        "%d email(s) found, %d propagated from existing rows.",
+        total_flagged, unique_people,
+        total_flagged - unique_people,
+        emails_found, propagated,
     )
     return results

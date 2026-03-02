@@ -12,6 +12,7 @@ For each member under a candidate PI (those that passed the coarse filter):
 """
 import json
 import logging
+import re
 
 from src import llm
 from src.config import Config
@@ -20,6 +21,18 @@ from src.pipeline2.step2_scholar_lookup import ScholarResult
 from src.sheets import SheetsClient
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Name normalisation for identity dedup (mirrors step2_scholar_lookup)
+# ---------------------------------------------------------------------------
+
+_MIDDLE_INITIAL_RE = re.compile(r"(?<=\s)[a-z]\.\s*")
+
+
+def _normalize_member_name(name: str) -> str:
+    n = name.strip().lower()
+    n = _MIDDLE_INITIAL_RE.sub("", n)
+    return " ".join(n.split())
 
 _SYSTEM = (
     "You assess whether individual researchers are relevant to a specific research "
@@ -148,8 +161,8 @@ def score_relevance(
     client = SheetsClient(config)
     all_rows = client.read_all_rows(tab_name)
 
-    # Build member list for scoring
-    members: list[dict] = []
+    # Build a flat member list (one entry per sheet row)
+    raw_members: list[dict] = []
     for row in all_rows:
         pi_name = row.get("pi_name", "").strip()
         institution = row.get("institution", "").strip()
@@ -168,7 +181,7 @@ def score_relevance(
             raw = row.get("recent_papers", "").strip()
             papers = [p.strip() for p in raw.split(";") if p.strip()] if raw else []
 
-        members.append({
+        raw_members.append({
             "member_name": member_name,
             "pi_name": pi_name,
             "institution": institution,
@@ -176,19 +189,75 @@ def score_relevance(
             "papers": papers,
         })
 
-    if not members:
+    if not raw_members:
         logger.warning("score_relevance: no members found for the given candidate PIs")
         return []
 
-    batch_size = config.settings.sonnet_batch_size
-    all_scored: list[dict] = []
+    # ------------------------------------------------------------------
+    # Dedup by normalised (member_name, institution).
+    # A person listed under N PIs is scored once with combined lab context;
+    # the result fans back to all original (pi_name, member_name) rows.
+    # ------------------------------------------------------------------
+    identity_to_group: dict[tuple[str, str], list[dict]] = {}
+    for m in raw_members:
+        identity = (_normalize_member_name(m["member_name"]), m["institution"].lower())
+        identity_to_group.setdefault(identity, []).append(m)
 
-    for batch in chunks(members, batch_size):
-        all_scored.extend(_score_batch(situation, batch))
+    total_rows = len(raw_members)
+    unique_people = len(identity_to_group)
+    logger.info(
+        "Relevance scoring: %d row(s) → %d unique member(s) "
+        "(%d duplicate scoring(s) avoided)",
+        total_rows, unique_people, total_rows - unique_people,
+    )
+
+    # Build one scoring entry per unique person; for multi-PI people combine
+    # all lab summaries so the LLM has the full picture.
+    unique_members: list[dict] = []
+    unique_identities: list[tuple[str, str]] = []
+
+    for identity, group in identity_to_group.items():
+        primary = group[0]
+        if len(group) == 1:
+            lab_summary = primary["lab_research_summary"]
+        else:
+            parts = [
+                f"{m['pi_name']} — {m['lab_research_summary']}"
+                for m in group
+                if m["lab_research_summary"]
+            ]
+            lab_summary = "; also in: ".join(parts) if parts else ""
+
+        unique_members.append({
+            "member_name": primary["member_name"],
+            "pi_name": primary["pi_name"],
+            "institution": primary["institution"],
+            "lab_research_summary": lab_summary,
+            "papers": primary["papers"],
+        })
+        unique_identities.append(identity)
+
+    # Score unique members
+    batch_size = config.settings.sonnet_batch_size
+    scored_unique: list[dict] = []
+    for batch in chunks(unique_members, batch_size):
+        scored_unique.extend(_score_batch(situation, batch))
+
+    # Fan scored results back to ALL original (pi_name, member_name) rows
+    all_scored: list[dict] = []
+    for scored, identity in zip(scored_unique, unique_identities):
+        for m in identity_to_group[identity]:
+            all_scored.append({
+                "member_name": m["member_name"],
+                "pi_name": m["pi_name"],
+                "institution": m["institution"],
+                "relevance_flag": scored["relevance_flag"],
+                "relevance_reasoning": scored["relevance_reasoning"],
+            })
 
     relevant_count = sum(1 for r in all_scored if r["relevance_flag"])
     logger.info(
-        "score_relevance: %d members scored — %d relevant (%.0f%%), %d not relevant",
+        "score_relevance: %d member(s) scored — %d relevant (%.0f%%), %d not relevant",
         len(all_scored),
         relevant_count,
         relevant_count / len(all_scored) * 100 if all_scored else 0,
