@@ -31,7 +31,12 @@ from src.pipeline2.step1_coarse_filter import coarse_filter_pis
 from src.pipeline2.step2_scholar_lookup import lookup_members
 from src.pipeline2.step3_fine_scoring import score_relevance
 from src.pipeline2.step4_email_lookup import lookup_emails
-from src.pipeline2.step5_sheet_writer import write_pipeline2_results
+from src.pipeline2.step5_sheet_writer import (
+    write_email_batch,
+    write_pipeline2_results,
+    write_relevance_batch,
+    write_scholar_batch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,12 +73,69 @@ def run_pipeline2(
 
     # ------------------------------------------------------------------
     # Step 2: Scholar lookup (optional)
+    #
+    # When not dry_run: lookups fire an on_batch_complete callback every
+    # scholar_flush_interval members.  Each callback immediately writes
+    # Scholar data, scores that batch, looks up emails for flagged members,
+    # and writes emails — so partial results reach the sheet quickly and
+    # a crash only loses at most flush_interval lookups worth of work.
     # ------------------------------------------------------------------
     scholar_results: dict = {}
+
+    # Shared state accumulated by the incremental-flush callback
+    _flush_state: dict = {
+        "scholar_results": {},   # all Scholar results seen so far
+        "emails": {},            # all emails written so far
+        "batch_num": 0,
+    }
+
+    def _flush_batch(batch: dict) -> None:
+        """Callback fired every flush_interval Scholar lookups."""
+        _flush_state["batch_num"] += 1
+        batch_n = _flush_state["batch_num"]
+        scholar_b = batch["scholar_results"]
+        pi_ids_b = batch["pi_identifiers"]
+
+        logger.info(
+            "=== Incremental flush — batch %d: %d Scholar result(s) for %d PI(s) ===",
+            batch_n, len(scholar_b), len(set(pi_ids_b)),
+        )
+
+        # a. Persist Scholar data to the sheet
+        n_written = write_scholar_batch(scholar_b, config, tab_name=tab_name)
+        _flush_state["scholar_results"].update(scholar_b)
+
+        # b. Score this batch's members (uses just-written Scholar data)
+        batch_scores = score_relevance(
+            pi_ids_b, scholar_b, situation, config, tab_name=tab_name
+        )
+        write_relevance_batch(batch_scores, situation, config, tab_name=tab_name)
+
+        # c. Email lookup for flagged members in this batch
+        flagged_b = [s for s in batch_scores if s["relevance_flag"]]
+        batch_emails: dict = {}
+        if flagged_b:
+            batch_emails = lookup_emails(flagged_b, config)
+            write_email_batch(batch_emails, config, tab_name=tab_name)
+            _flush_state["emails"].update(batch_emails)
+
+        logger.info(
+            "Batch %d flush complete: %d Scholar written, %d scored, "
+            "%d relevant, %d emails written",
+            batch_n, n_written, len(batch_scores),
+            len(flagged_b),
+            sum(1 for e in batch_emails.values() if e),
+        )
+
     if skip_scholar:
         logger.info("Step 2: Scholar lookup skipped (--skip-scholar)")
     else:
-        scholar_results = lookup_members(passing_pis, config, tab_name=tab_name)
+        scholar_results = lookup_members(
+            passing_pis,
+            config,
+            tab_name=tab_name,
+            on_batch_complete=_flush_batch if not dry_run else None,
+        )
         found = sum(1 for r in scholar_results.values() if r.status == "found")
         ambig = sum(1 for r in scholar_results.values() if r.status == "ambiguous")
         not_found = sum(1 for r in scholar_results.values() if r.status == "not_found")
@@ -84,10 +146,20 @@ def run_pipeline2(
         )
 
     # ------------------------------------------------------------------
-    # Step 3: Fine relevance scoring
+    # Step 3: Final relevance scoring — ALL candidate members
+    #
+    # When incremental flush ran (not skip_scholar, not dry_run), per-batch
+    # scores already give early visibility, but we re-score the full candidate
+    # set here for consistency and to catch any cross-batch differences.
+    # All Scholar data from the incremental passes is used.
     # ------------------------------------------------------------------
+    _all_scholar = _flush_state["scholar_results"] if not skip_scholar and not dry_run else scholar_results
+    if not skip_scholar and not dry_run:
+        logger.info(
+            "Step 3: Final reconciliation — scoring ALL %d candidate PI(s)", len(passing_pis)
+        )
     relevance_scores = score_relevance(
-        passing_pis, scholar_results, situation, config, tab_name=tab_name
+        passing_pis, _all_scholar, situation, config, tab_name=tab_name
     )
     flagged = sum(1 for r in relevance_scores if r["relevance_flag"])
     logger.info(
@@ -98,15 +170,36 @@ def run_pipeline2(
     )
 
     # ------------------------------------------------------------------
-    # Step 4: Email lookup (relevant members only)
+    # Step 4: Email lookup
+    #
+    # Incremental path: emails were written per batch; only look up emails
+    # for any members who became relevant in the final reconciliation but
+    # were not already covered by a batch pass.
+    # Original path (skip_scholar or dry_run): look up all flagged members.
     # ------------------------------------------------------------------
     flagged_members = [r for r in relevance_scores if r["relevance_flag"]]
-    emails = lookup_emails(flagged_members, config)
+    new_emails: dict = {}
+    if not skip_scholar and not dry_run:
+        already_looked_up = set(_flush_state["emails"].keys())
+        new_flagged = [
+            m for m in flagged_members
+            if (m["pi_name"], m["member_name"]) not in already_looked_up
+        ]
+        new_emails = lookup_emails(new_flagged, config) if new_flagged else {}
+        emails = {**_flush_state["emails"], **new_emails}
+    else:
+        emails = lookup_emails(flagged_members, config)
+
     emails_found = sum(1 for e in emails.values() if e)
     logger.info("Step 4: %d email(s) found for %d flagged member(s)", emails_found, len(flagged_members))
 
     # ------------------------------------------------------------------
     # Step 5: Write to sheet (or dry run)
+    #
+    # Incremental path: Scholar data and per-batch emails were already
+    # written; pass empty dicts for those to avoid redundant updates.
+    # The final write handles relevance scores for ALL active rows and
+    # any new emails found in Step 4 above.
     # ------------------------------------------------------------------
     sheet_summary: dict = {}
 
@@ -127,7 +220,16 @@ def run_pipeline2(
             len(relevance_scores), dry_run_path,
         )
         sheet_summary = {"rows_scored": len(relevance_scores), "dry_run": True}
+    elif not skip_scholar:
+        # Incremental path: Scholar data already written per batch.
+        # Final pass: write remaining new emails + full relevance reconciliation.
+        if new_emails:
+            write_email_batch(new_emails, config, tab_name=tab_name)
+        sheet_summary = write_pipeline2_results(
+            relevance_scores, {}, {}, situation, config, tab_name=tab_name
+        )
     else:
+        # skip_scholar path: write everything in one pass (original behaviour).
         sheet_summary = write_pipeline2_results(
             relevance_scores, scholar_results, emails, situation, config, tab_name=tab_name
         )

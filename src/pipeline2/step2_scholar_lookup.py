@@ -28,6 +28,7 @@ import logging
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Protocol
@@ -197,15 +198,29 @@ def lookup_members(
     candidate_pis: list[str],
     config: Config,
     tab_name: str = "Master List",
+    on_batch_complete: Callable[[dict], None] | None = None,
 ) -> dict[tuple[str, str], ScholarResult]:
     """
     Run Google Scholar lookups for all members belonging to the candidate PIs.
 
     Args:
-        candidate_pis: List of "{pi_name}|||{institution}" identifiers
-                       (output from step1_coarse_filter).
-        config:        Loaded Config.
-        tab_name:      Sheet tab to read member rows from.
+        candidate_pis:     List of "{pi_name}|||{institution}" identifiers
+                           (output from step1_coarse_filter).
+        config:            Loaded Config.
+        tab_name:          Sheet tab to read member rows from.
+        on_batch_complete: Optional callback fired every `scholar_flush_interval`
+                           lookups (and once more for any remainder at the end).
+                           Called with a dict::
+
+                               {
+                                 "scholar_results": dict[(pi_name, member_name),
+                                                         ScholarResult],
+                                 "pi_identifiers":  list["{pi_name}|||{institution}"],
+                               }
+
+                           Allows the caller to flush Scholar data and run
+                           downstream steps (scoring, email) incrementally
+                           rather than waiting for the full run to finish.
 
     Returns:
         Dict mapping (pi_name, member_name) → ScholarResult.
@@ -254,6 +269,10 @@ def lookup_members(
 
     lookup_start = time.monotonic()
 
+    # Pending batch state — accumulated between callback fires
+    pending_scholar: dict[tuple[str, str], ScholarResult] = {}
+    pending_pi_ids: set[str] = set()
+
     for row in eligible_rows:
         pi_name = row.get("pi_name", "").strip()
         institution = row.get("institution", "").strip()
@@ -266,8 +285,14 @@ def lookup_members(
         if result.status == "error":
             error_count += 1
 
+        # Accumulate into the pending batch for the callback
+        if on_batch_complete is not None:
+            pending_scholar[(pi_name, member_name)] = result
+            pending_pi_ids.add(f"{pi_name}|||{institution}")
+
         # Progress logging: first, every flush_interval, and last lookup
-        if total_lookups == 1 or total_lookups % flush_interval == 0 or total_lookups == total_eligible:
+        is_flush_point = (total_lookups % flush_interval == 0) or (total_lookups == total_eligible)
+        if total_lookups == 1 or is_flush_point:
             elapsed = time.monotonic() - lookup_start
             avg_per = elapsed / total_lookups
             remaining = total_eligible - total_lookups
@@ -280,6 +305,15 @@ def lookup_members(
                 member_name, result.status,
                 elapsed, eta,
             )
+
+        # Fire callback at every flush_interval boundary and at the final lookup
+        if on_batch_complete is not None and pending_scholar and is_flush_point:
+            on_batch_complete({
+                "scholar_results": dict(pending_scholar),
+                "pi_identifiers": list(pending_pi_ids),
+            })
+            pending_scholar.clear()
+            pending_pi_ids.clear()
 
         # Warn and pause if error rate exceeds threshold (check after ≥5 lookups)
         if total_lookups >= 5 and error_count / total_lookups > _ERROR_RATE_THRESHOLD:
