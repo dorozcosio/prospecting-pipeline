@@ -5,3 +5,5 @@ sonnet_call_delay: 13    # 5 RPM = 12s minimum, add 1s buffer
 haiku_call_delay: 13     # same limit on free tier
 scholar_delay_range: [10, 30]
 scholar_backend: serpapi
+scholar_flush_interval: 25  # log Scholar lookup progress every N members
+client_timeout_seconds: 120  # httpx read timeout for Anthropic API calls

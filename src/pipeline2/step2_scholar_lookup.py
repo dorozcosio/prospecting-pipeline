@@ -226,33 +226,38 @@ def lookup_members(
     results: dict[tuple[str, str], ScholarResult] = {}
     total_lookups = 0
     error_count = 0
+    flush_interval = config.settings.scholar_flush_interval
 
+    # Pre-count eligible members so we can report progress as N/total.
+    eligible_rows = []
     for row in all_rows:
         pi_name = row.get("pi_name", "").strip()
         institution = row.get("institution", "").strip()
         member_name = row.get("member_name", "").strip()
-
         if not member_name or not pi_name:
             continue
-
-        # Only process members under candidate PIs
         if (pi_name, institution) not in candidate_set:
             continue
-
-        # Skip if cached and fresh
         recent_papers = row.get("recent_papers", "").strip()
         last_enriched_str = row.get("last_enriched", "").strip()
         if recent_papers and last_enriched_str:
             try:
                 last_enriched = date.fromisoformat(last_enriched_str)
                 if last_enriched >= cache_cutoff:
-                    logger.debug(
-                        "Cache hit for %s (%s) — skipping Scholar lookup",
-                        member_name, pi_name,
-                    )
                     continue
             except ValueError:
-                pass  # malformed date → proceed with lookup
+                pass
+        eligible_rows.append(row)
+
+    total_eligible = len(eligible_rows)
+    logger.info("Scholar lookup: %d member(s) to look up", total_eligible)
+
+    lookup_start = time.monotonic()
+
+    for row in eligible_rows:
+        pi_name = row.get("pi_name", "").strip()
+        institution = row.get("institution", "").strip()
+        member_name = row.get("member_name", "").strip()
 
         result = backend.lookup(member_name, institution)
         results[(pi_name, member_name)] = result
@@ -260,6 +265,21 @@ def lookup_members(
 
         if result.status == "error":
             error_count += 1
+
+        # Progress logging: first, every flush_interval, and last lookup
+        if total_lookups == 1 or total_lookups % flush_interval == 0 or total_lookups == total_eligible:
+            elapsed = time.monotonic() - lookup_start
+            avg_per = elapsed / total_lookups
+            remaining = total_eligible - total_lookups
+            eta = avg_per * remaining
+            pct = total_lookups / total_eligible * 100 if total_eligible else 0
+            logger.info(
+                "Scholar lookup progress: %d/%d (%.0f%%). "
+                "Last: %s — %s. Elapsed: %.0fs. Est. remaining: %.0fs.",
+                total_lookups, total_eligible, pct,
+                member_name, result.status,
+                elapsed, eta,
+            )
 
         # Warn and pause if error rate exceeds threshold (check after ≥5 lookups)
         if total_lookups >= 5 and error_count / total_lookups > _ERROR_RATE_THRESHOLD:

@@ -148,6 +148,7 @@ def run_pipeline1(
 
     all_members_written: list[dict] = []
     dry_run_rows: list[dict] = []
+    cumulative = {"added": 0, "updated": 0, "reactivated": 0, "deactivated": 0, "unchanged": 0}
 
     for group_start in range(0, len(remaining_pis), group_size):
         group = remaining_pis[group_start : group_start + group_size]
@@ -178,6 +179,8 @@ def run_pipeline1(
                 deactivate_missing=False,
             )
             all_members_written.extend(group_members)
+            for k in cumulative:
+                cumulative[k] += result.get(k, 0)
             logger.info("Group %d written: %s", group_num, result)
 
         # Checkpoint
@@ -215,12 +218,14 @@ def run_pipeline1(
             tab_name=tab_name,
             deactivate_missing=True,
         )
+        for k in cumulative:
+            cumulative[k] += deactivation_result.get(k, 0)
         logger.info("Deactivation pass: %s", deactivation_result)
 
     # ------------------------------------------------------------------
     # Dry-run save
     # ------------------------------------------------------------------
-    sheet_summary: dict = {}
+    sheet_summary: dict = cumulative
     if dry_run:
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         dry_run_path = Path("logs") / f"p1_dry_run_{ts}.json"

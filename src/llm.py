@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import anthropic
+import httpx
 
 from src.config import get_config
 
@@ -36,7 +37,11 @@ _last_call_time: dict[str, float] = {}
 def _get_client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=get_config().anthropic_api_key)
+        read_timeout = float(get_config().settings.client_timeout_seconds)
+        _client = anthropic.Anthropic(
+            api_key=get_config().anthropic_api_key,
+            timeout=httpx.Timeout(connect=30.0, read=read_timeout, write=30.0, pool=30.0),
+        )
     return _client
 
 
@@ -103,6 +108,17 @@ def _call(model: str, prompt: str, system: str, _attempt: int = 0) -> str:
         wait = int(retry_after) if retry_after else 60 * (2 ** _attempt)
         logger.warning(
             "Rate limit on %s — retrying in %ds (attempt %d/%d)",
+            model, wait, _attempt + 1, MAX_RETRIES,
+        )
+        time.sleep(wait)
+        return _call(model, prompt, system, _attempt + 1)
+
+    except anthropic.APITimeoutError:
+        if _attempt >= MAX_RETRIES:
+            raise
+        wait = 5 * (2 ** _attempt)  # 5s, 10s, 20s, 40s, 80s
+        logger.warning(
+            "Timeout on %s — retrying in %ds (attempt %d/%d)",
             model, wait, _attempt + 1, MAX_RETRIES,
         )
         time.sleep(wait)
