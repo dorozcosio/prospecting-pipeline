@@ -215,7 +215,12 @@ class TestIncrementalFlushCallback:
         assert captured == []
 
     def test_cached_members_skipped(self):
-        """Members with recent_papers + a current last_enriched date are not looked up."""
+        """
+        Members with recent_papers + a current last_enriched date are resolved
+        from cache without a backend call.  Their results still appear in the
+        returned dict (fanned from cache), so the result covers all 10 rows.
+        Only the 7 non-cached members trigger backend.lookup() calls.
+        """
         from datetime import date
 
         today_str = date.today().isoformat()
@@ -227,10 +232,13 @@ class TestIncrementalFlushCallback:
 
         on_batch, captured = _capture_callback()
 
-        with _patch_lookup(rows) as (config, _):
+        with _patch_lookup(rows) as (config, backend):
             results = lookup_members(_CANDIDATE_PIS, config, on_batch_complete=on_batch)
 
-        # Only 7 non-cached members should be looked up
-        assert len(results) == 7
+        # All 10 members have a result (3 from cache, 7 from lookup)
+        assert len(results) == _N_MEMBERS
+        # Only 7 fresh lookups were performed
+        assert backend.lookup.call_count == 7
+        # Callback batches cover only the 7 looked-up members
         total_in_batches = sum(len(b["scholar_results"]) for b in captured)
         assert total_in_batches == 7

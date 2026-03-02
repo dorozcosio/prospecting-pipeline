@@ -33,6 +33,26 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Protocol
 
+# ---------------------------------------------------------------------------
+# Name normalisation for identity dedup
+# ---------------------------------------------------------------------------
+
+# Match a single letter followed by a period, preceded by whitespace
+# (captures middle initials like "A." in "John A. Smith" → "John Smith").
+_MIDDLE_INITIAL_RE = re.compile(r"(?<=\s)[a-z]\.\s*")
+
+
+def _normalize_member_name(name: str) -> str:
+    """
+    Normalize a researcher name for cross-PI identity dedup.
+
+    Lowercases, strips, and removes middle initials so that e.g.
+    "John A. Smith" and "John Smith" map to the same identity key.
+    """
+    n = name.strip().lower()
+    n = _MIDDLE_INITIAL_RE.sub("", n)
+    return " ".join(n.split())
+
 from serpapi import GoogleSearch
 
 from src.config import Config
@@ -243,8 +263,12 @@ def lookup_members(
     error_count = 0
     flush_interval = config.settings.scholar_flush_interval
 
-    # Pre-count eligible members so we can report progress as N/total.
-    eligible_rows = []
+    # ------------------------------------------------------------------
+    # Group candidate rows by normalised member identity.
+    # A person listed under 2 PIs generates 2 rows but only 1 lookup.
+    # Identity key: (normalised_member_name, institution_lower).
+    # ------------------------------------------------------------------
+    identity_to_rows: dict[tuple[str, str], list[dict]] = {}
     for row in all_rows:
         pi_name = row.get("pi_name", "").strip()
         institution = row.get("institution", "").strip()
@@ -253,19 +277,48 @@ def lookup_members(
             continue
         if (pi_name, institution) not in candidate_set:
             continue
-        recent_papers = row.get("recent_papers", "").strip()
-        last_enriched_str = row.get("last_enriched", "").strip()
-        if recent_papers and last_enriched_str:
-            try:
-                last_enriched = date.fromisoformat(last_enriched_str)
-                if last_enriched >= cache_cutoff:
-                    continue
-            except ValueError:
-                pass
-        eligible_rows.append(row)
+        identity = (_normalize_member_name(member_name), institution.lower())
+        identity_to_rows.setdefault(identity, []).append(row)
 
-    total_eligible = len(eligible_rows)
-    logger.info("Scholar lookup: %d member(s) to look up", total_eligible)
+    total_rows = sum(len(rows) for rows in identity_to_rows.values())
+    unique_people = len(identity_to_rows)
+
+    # Resolve identities: pre-populate cached ones, collect eligible groups.
+    eligible_groups: list[tuple[dict, list[dict]]] = []  # (rep_row, all_rows)
+    cached_group_count = 0
+
+    for rows in identity_to_rows.values():
+        cached_result: ScholarResult | None = None
+        for row in rows:
+            recent_papers = row.get("recent_papers", "").strip()
+            last_enriched_str = row.get("last_enriched", "").strip()
+            if recent_papers and last_enriched_str:
+                try:
+                    last_enriched = date.fromisoformat(last_enriched_str)
+                    if last_enriched >= cache_cutoff:
+                        papers = [p.strip() for p in recent_papers.split(";") if p.strip()]
+                        status = row.get("scholar_lookup_status", "") or "found"
+                        cached_result = ScholarResult(status=status, papers=papers)
+                        break
+                except ValueError:
+                    pass
+        if cached_result is not None:
+            for row in rows:
+                results[(row.get("pi_name", "").strip(), row.get("member_name", "").strip())] = cached_result
+            cached_group_count += 1
+        else:
+            eligible_groups.append((rows[0], rows))
+
+    total_eligible = len(eligible_groups)
+    logger.info(
+        "Scholar lookups: %d row(s) → %d unique member(s) "
+        "(%d duplicate lookup(s) avoided, %d cache hit(s)). "
+        "%d lookup(s) to perform.",
+        total_rows, unique_people,
+        total_rows - unique_people,
+        cached_group_count,
+        total_eligible,
+    )
 
     lookup_start = time.monotonic()
 
@@ -273,22 +326,25 @@ def lookup_members(
     pending_scholar: dict[tuple[str, str], ScholarResult] = {}
     pending_pi_ids: set[str] = set()
 
-    for row in eligible_rows:
-        pi_name = row.get("pi_name", "").strip()
-        institution = row.get("institution", "").strip()
-        member_name = row.get("member_name", "").strip()
+    for rep_row, group_rows in eligible_groups:
+        member_name = rep_row.get("member_name", "").strip()
+        institution = rep_row.get("institution", "").strip()
 
         result = backend.lookup(member_name, institution)
-        results[(pi_name, member_name)] = result
         total_lookups += 1
 
         if result.status == "error":
             error_count += 1
 
-        # Accumulate into the pending batch for the callback
-        if on_batch_complete is not None:
-            pending_scholar[(pi_name, member_name)] = result
-            pending_pi_ids.add(f"{pi_name}|||{institution}")
+        # Fan the result to ALL rows in this identity group
+        for row in group_rows:
+            pi_name = row.get("pi_name", "").strip()
+            row_member_name = row.get("member_name", "").strip()
+            row_institution = row.get("institution", "").strip()
+            results[(pi_name, row_member_name)] = result
+            if on_batch_complete is not None:
+                pending_scholar[(pi_name, row_member_name)] = result
+                pending_pi_ids.add(f"{pi_name}|||{row_institution}")
 
         # Progress logging: first, every flush_interval, and last lookup
         is_flush_point = (total_lookups % flush_interval == 0) or (total_lookups == total_eligible)
@@ -329,7 +385,7 @@ def lookup_members(
     not_found = sum(1 for r in results.values() if r.status == "not_found")
 
     logger.info(
-        "lookup_members: %d lookups — %d found, %d ambiguous, %d not_found, %d errors",
+        "lookup_members: %d lookup(s) performed — %d found, %d ambiguous, %d not_found, %d errors",
         total_lookups, found, ambig, not_found, error_count,
     )
     return results
