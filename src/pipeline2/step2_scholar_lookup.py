@@ -30,7 +30,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Protocol
 
 # ---------------------------------------------------------------------------
@@ -294,7 +294,7 @@ def lookup_members(
             last_enriched_str = row.get("last_enriched", "").strip()
             if recent_papers and last_enriched_str:
                 try:
-                    last_enriched = date.fromisoformat(last_enriched_str)
+                    last_enriched = datetime.fromisoformat(last_enriched_str).date()
                     if last_enriched >= cache_cutoff:
                         papers = [p.strip() for p in recent_papers.split(";") if p.strip()]
                         status = row.get("scholar_lookup_status", "") or "found"
