@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 
 from src import cache, llm
 from src.config import Config
+from src.name_utils import normalize_name
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +54,6 @@ _DEPT_HINTS: dict[str, str] = {
 }
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
-_MIDDLE_INITIAL_RE = re.compile(r"\b[A-Z]\.\s+")
-_WHITESPACE_RE = re.compile(r"\s+")
 
 
 # ---------------------------------------------------------------------------
@@ -102,17 +101,10 @@ def _infer_department(url: str) -> str:
 # Name deduplication
 # ---------------------------------------------------------------------------
 
-def _normalize_name(name: str) -> str:
-    """Lowercase, remove middle initials, collapse whitespace."""
-    name = name.lower().strip()
-    name = _MIDDLE_INITIAL_RE.sub("", name)
-    return _WHITESPACE_RE.sub(" ", name).strip()
-
-
 def _deduplicate(pis: list[dict]) -> list[dict]:
     seen: dict[str, dict] = {}
     for pi in pis:
-        key = _normalize_name(pi["name"])
+        key = normalize_name(pi["name"])
         if key not in seen:
             seen[key] = pi
         elif pi.get("role") and not seen[key].get("role"):

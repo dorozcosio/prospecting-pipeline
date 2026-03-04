@@ -13,6 +13,19 @@ ROOT = Path(__file__).parent.parent
 
 
 @dataclass
+class RescrapeSettings:
+    max_lab_search_candidates: int = 3
+    lab_url_boost_keywords: list = field(default_factory=lambda: ["lab", "group", "research"])
+    lab_url_penalize_domains: list = field(default_factory=lambda: [
+        "scholar.google.com",
+        "pubmed.ncbi.nlm.nih.gov",
+        "linkedin.com",
+        "researchgate.net",
+        "news.google.com",
+    ])
+
+
+@dataclass
 class Settings:
     scholar_cache_days: int = 90
     haiku_batch_size: int = 40
@@ -23,6 +36,7 @@ class Settings:
     scholar_backend: str = "serpapi"
     scholar_flush_interval: int = 25
     client_timeout_seconds: int = 120
+    rescrape: RescrapeSettings = field(default_factory=RescrapeSettings)
 
 
 @dataclass
@@ -71,6 +85,14 @@ def load_config() -> Config:
                            "scholar_flush_interval", "client_timeout_seconds"):
             if field_name in raw:
                 setattr(settings, field_name, raw[field_name])
+        if "rescrape" in raw:
+            r = raw["rescrape"] or {}
+            rs = RescrapeSettings()
+            for field_name in ("max_lab_search_candidates", "lab_url_boost_keywords",
+                               "lab_url_penalize_domains"):
+                if field_name in r:
+                    setattr(rs, field_name, r[field_name])
+            settings.rescrape = rs
 
     missing = [k for k in ("GOOGLE_SERVICE_ACCOUNT_KEY_PATH", "GOOGLE_SHEET_ID",
                             "ANTHROPIC_API_KEY", "SERPAPI_API_KEY")

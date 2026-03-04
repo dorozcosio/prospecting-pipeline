@@ -32,6 +32,7 @@ import logging
 from datetime import datetime, timezone
 
 from src.config import Config
+from src.name_utils import normalize_name
 from src.sheets import SheetsClient
 
 logger = logging.getLogger(__name__)
@@ -66,9 +67,9 @@ def init_run_cache() -> None:
 
 def _composite_key(row: dict) -> tuple[str, str, str]:
     return (
-        row.get("institution", "").strip().lower(),
-        row.get("pi_name", "").strip().lower(),
-        row.get("member_name", "").strip().lower(),
+        normalize_name(row.get("institution", "")),
+        normalize_name(row.get("pi_name", "")),
+        normalize_name(row.get("member_name", "")),
     )
 
 
