@@ -139,6 +139,45 @@ def _summarize_batch(batch: list[dict], model: str = "haiku") -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Public summarization helper (also used by pipeline_rescrape.py)
+# ---------------------------------------------------------------------------
+
+def summarize_lab_pages(
+    pi_page_pairs: list[tuple[str, str, str]],
+    config: Config,
+) -> dict[str, str]:
+    """
+    Summarize lab homepages for a list of PIs.
+
+    Args:
+        pi_page_pairs: List of (pi_name, url, cleaned_text) tuples.
+        config:        Loaded Config.
+
+    Returns:
+        Dict mapping pi_name -> 1–2 sentence research summary string.
+        Missing entries mean no summary could be produced for that PI.
+    """
+    pages = [{"name": n, "url": u, "text": t} for n, u, t in pi_page_pairs]
+
+    haiku_pages = [p for p in pages if _choose_model_for_summary(p["text"]) == "haiku"]
+    sonnet_pages = [p for p in pages if _choose_model_for_summary(p["text"]) == "sonnet"]
+
+    summaries: dict[str, str] = {}
+    for model, batch_pages, batch_size in (
+        ("haiku", haiku_pages, config.settings.haiku_batch_size),
+        ("sonnet", sonnet_pages, config.settings.sonnet_batch_size),
+    ):
+        if not batch_pages:
+            continue
+        texts = [p["text"] for p in batch_pages]
+        for index_batch in llm.build_batches(texts, max_items=batch_size):
+            batch = [batch_pages[i] for i in index_batch]
+            summaries.update(_summarize_batch(batch, model=model))
+
+    return summaries
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -212,32 +251,16 @@ def find_lab_homepages(pis: list[dict], config: Config) -> list[dict]:
         pi.setdefault("lab_homepage_url", "")
         pi.setdefault("lab_research_summary", "")
 
-    # 5. Batch summarisation — split by model based on page length
+    # 5. Batch summarisation via shared helper
     name_to_pi = {pi["name"]: pi for pi in enriched}
-
-    haiku_pages = [p for p in pages_to_summarize if _choose_model_for_summary(p["text"]) == "haiku"]
-    sonnet_pages = [p for p in pages_to_summarize if _choose_model_for_summary(p["text"]) == "sonnet"]
-
-    if sonnet_pages:
-        logger.info(
-            "find_lab_homepages: %d pages → Haiku, %d pages → Sonnet",
-            len(haiku_pages), len(sonnet_pages),
-        )
-
-    for model, pages, batch_size in (
-        ("haiku", haiku_pages, config.settings.haiku_batch_size),
-        ("sonnet", sonnet_pages, config.settings.sonnet_batch_size),
-    ):
-        if not pages:
-            continue
-        texts = [p["text"] for p in pages]
-        for index_batch in llm.build_batches(texts, max_items=batch_size):
-            batch = [pages[i] for i in index_batch]
-            summaries = _summarize_batch(batch, model=model)
-            for item in batch:
-                pi_ref = name_to_pi.get(item["name"])
-                if pi_ref is not None:
-                    pi_ref["lab_research_summary"] = summaries.get(item["name"], "")
+    pi_page_pairs = [
+        (p["name"], p["url"], p["text"]) for p in pages_to_summarize
+    ]
+    summaries = summarize_lab_pages(pi_page_pairs, config)
+    for pi_name, summary in summaries.items():
+        pi_ref = name_to_pi.get(pi_name)
+        if pi_ref is not None:
+            pi_ref["lab_research_summary"] = summary
 
     found = sum(1 for pi in enriched if pi.get("lab_homepage_url"))
     logger.info("find_lab_homepages: %d/%d PIs got a homepage", found, len(enriched))

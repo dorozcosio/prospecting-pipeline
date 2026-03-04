@@ -1,4 +1,16 @@
 scholar_cache_days: 90
+rescrape:
+  max_lab_search_candidates: 3
+  lab_url_boost_keywords:
+    - lab
+    - group
+    - research
+  lab_url_penalize_domains:
+    - scholar.google.com
+    - pubmed.ncbi.nlm.nih.gov
+    - linkedin.com
+    - researchgate.net
+    - news.google.com
 sonnet_batch_size: 15
 haiku_batch_size: 40
 sonnet_call_delay: 13    # 5 RPM = 12s minimum, add 1s buffer
